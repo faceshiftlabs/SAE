@@ -1,6 +1,8 @@
 import tensorflow as tf
-from tensorflow._api.v1.layers import Layer
-
+# from tensorflow.keras.layers import Layer, Conv2D, PReLU, LeakyReLU, BatchNormalization, Add, Flatten, Dense, Reshape
+# from tensorflow.keras import Model, Input
+from tensorflow.python.keras.layers import Layer, Conv2D, PReLU, LeakyReLU, BatchNormalization, Add, Flatten, Dense, Reshape
+from tensorflow.python.keras import Model, Input
 
 
 class ReflectionPadding2D(Layer):
@@ -30,12 +32,17 @@ class _Conv2D(Layer):
                 self.pad = (kernel_size // 2,) * 2
                 kwargs['padding'] = 'valid'
                 self.reflect_pad = True
-        self.func = tf.keras.layers.Conv2D(*args, **kwargs)
+        self.func = Conv2D(*args, **kwargs)
 
     def call(self, inputs, **kwargs):
         if self.reflect_pad:
             inputs = ReflectionPadding2D(self.pad)(inputs)
         return self.func(inputs)
+
+    def compute_output_shape(self, input_shape):
+        if self.reflect_pad:
+            input_shape = ReflectionPadding2D(self.pad).compute_output_shape(input_shape)
+        return self.func.compute_output_shape(input_shape)
 
 
 class _Act(Layer):
@@ -43,12 +50,15 @@ class _Act(Layer):
         super(_Act, self).__init__(**kwargs)
 
         if act == 'prelu':
-            self.func = tf.keras.layers.PReLU()
+            self.func = PReLU()
         else:
-            self.func = tf.keras.layers.LeakyReLU(alpha=lrelu_alpha)
+            self.func = LeakyReLU(alpha=lrelu_alpha)
 
     def call(self, inputs, **kwargs):
         return self.func(inputs)
+
+    def compute_output_shape(self, input_shape):
+        return self.func.compute_output_shape(input_shape)
 
 
 class _Norm(Layer):
@@ -61,11 +71,13 @@ class _Norm(Layer):
 
     def call(self, inputs, **kwargs):
         if self.norm == 'bn':
-            inputs = tf.keras.layers.BatchNormalization(axis=-1)(inputs)
+            inputs = BatchNormalization(axis=-1)(inputs)
         return inputs
-        # if self.norm:
-        #     inputs = self.func(inputs)
-        # return inputs
+
+    def compute_output_shape(self, input_shape):
+        if self.norm == 'bn':
+            input_shape = BatchNormalization(axis=-1).compute_output_shape(input_shape)
+        return input_shape
 
 
 class PixelShuffler(Layer):
@@ -94,17 +106,20 @@ class PixelShuffler(Layer):
 
 
 class Downscale(Layer):
-    def __init__(self, dim, padding='zero', norm='', act='', **kwargs):
+    def __init__(self, dim, **kwargs):
         super(Downscale, self).__init__(**kwargs)
-        self.conv_2d = _Conv2D(dim, kernel_size=5, strides=2, padding=padding)
-        self.act = _Act(act)
-        self.norm = _Norm(norm)
+        self.conv_2d = Conv2D(dim, kernel_size=5, strides=2, padding='same')
+        self.act = LeakyReLU(alpha=0.1)
 
     def call(self, inputs, **kwargs):
         x = self.conv_2d(inputs)
         x = self.act(x)
-        x = self.norm(x)
         return x
+
+    def compute_output_shape(self, input_shape):
+        input_shape = self.conv_2d.compute_output_shape(input_shape)
+        input_shape = self.act.compute_output_shape(input_shape)
+        return input_shape
 
 
 class Upscale(Layer):
@@ -117,10 +132,17 @@ class Upscale(Layer):
 
     def call(self, inputs, **kwargs):
         x = self.conv_2d(inputs)
-        x = self.act(inputs)
-        x = self.norm(inputs)
+        x = self.act(x)
+        x = self.norm(x)
         x = self.pixel_shuffler(x)
         return x
+
+    def compute_output_shape(self, input_shape):
+        input_shape = self.conv_2d.compute_output_shape(input_shape)
+        input_shape = self.act.compute_output_shape(input_shape)
+        input_shape = self.norm.compute_output_shape(input_shape)
+        input_shape = self.pixel_shuffler.compute_output_shape(input_shape)
+        return input_shape
 
 
 class ResidualBlock(Layer):
@@ -130,7 +152,7 @@ class ResidualBlock(Layer):
         self.act_1 = _Act(act, lrelu_alpha=0.2)
         self.norm_1 = _Norm(norm)
         self.conv_2d_2 = _Conv2D(filters, kernel_size=kernel_size, padding=padding)
-        self.add = tf.keras.layers.Add()
+        self.add = Add()
         self.act_2 = _Act(act, lrelu_alpha=0.2)
         self.norm_2 = _Norm(norm)
 
@@ -155,95 +177,55 @@ class ToBgr(Layer):
         return self.conv_2d(inputs)
 
 
-class Encoder(tf.keras.Model):
-    def __init__(self,
-                 num_channels=1,
-                 resolution=32,
-                 ch_dims=1,
-                 ae_dims=1,
-                 name='encoder',
-                 **kwargs):
-        super(Encoder, self).__init__(name=name, **kwargs)
+def encoder(num_channels=1, resolution=32, ch_dims=1, ae_dims=1, name='encoder') -> Model:
+    lowest_dense_res = resolution // 16
+    dims = num_channels * ch_dims
 
-        lowest_dense_res = resolution // 16
-        dims = num_channels * ch_dims
-
-        self.downscale_1 = Downscale(dims)
-        self.downscale_2 = Downscale(dims * 2)
-        self.downscale_3 = Downscale(dims * 4)
-        self.downscale_4 = Downscale(dims * 8)
-        self.flatten = tf.keras.layers.Flatten()
-        self.dense_1 = tf.keras.layers.Dense(ae_dims)
-        self.dense_2 = tf.keras.layers.Dense(lowest_dense_res**2 * ae_dims)
-        self.reshape = tf.keras.layers.Reshape((lowest_dense_res, lowest_dense_res, ae_dims))
-        self.upscale = Upscale(ae_dims)
-
-    def call(self, inputs, **kwargs):
-        x = self.downscale_1(inputs)
-        x = self.downscale_2(x)
-        x = self.downscale_3(x)
-        x = self.downscale_4(x)
-        x = self.flatten(x)
-        x = self.dense_1(x)
-        x = self.dense_2(x)
-        x = self.reshape(x)
-        x = self.upscale(x)
-        return x
+    inputs = Input(shape=(resolution, resolution, num_channels), name='image')
+    x = Downscale(dims)(inputs)
+    x = Downscale(dims * 2)(x)
+    x = Downscale(dims * 4)(x)
+    x = Flatten()(x)
+    x = Dense(ae_dims)(x)
+    x = Dense(lowest_dense_res**2 * ae_dims)(x)
+    x = Reshape((lowest_dense_res, lowest_dense_res, ae_dims))(x)
+    outputs = Upscale(ae_dims)(x)
+    return Model(inputs=inputs, outputs=outputs, name=name)
 
 
-class Decoder(tf.keras.Model):
-    def __init__(self,
-                 num_channels=1,
-                 ch_dims=1,
-                 add_residual_blocks=True,
-                 multiscale_count=3,
-                 name='decoder',
-                 **kwargs):
-        super(Decoder, self).__init__(name=name, **kwargs)
+def decoder(num_channels=1, resolution=32, ch_dims=1, ae_dims=1, add_residual_blocks=True, multiscale_count=3, name='decoder') -> Model:
+    lowest_dense_res = 2 * (resolution // 16)
+    dims = num_channels * ch_dims
 
-        dims = num_channels * ch_dims
+    inputs = Input(shape=(lowest_dense_res, lowest_dense_res, ae_dims))
+    outputs = []
 
-        self.upscale_1 = Upscale(dims * 8, **kwargs)
-        self.upscale_2 = Upscale(dims * 4, **kwargs)
-        self.upscale_3 = Upscale(dims * 2, **kwargs)
+    x1 = Upscale(dims * 8)(inputs)
+    if add_residual_blocks:
+        x1 = ResidualBlock(dims * 8)(x1)
+        x1 = ResidualBlock(dims * 8)(x1)
+    if multiscale_count >= 3:
+        outputs.append(ToBgr(num_channels)(x1))
 
-        self.residual_blocks = []
-        if add_residual_blocks:
-            self.residual_blocks = [ResidualBlock(dims * 8, **kwargs),
-                                    ResidualBlock(dims * 8, **kwargs),
-                                    ResidualBlock(dims * 4, **kwargs),
-                                    ResidualBlock(dims * 4, **kwargs),
-                                    ResidualBlock(dims * 2, **kwargs),
-                                    ResidualBlock(dims * 2, **kwargs)]
+    x2 = Upscale(dims * 4)(x1)
+    if add_residual_blocks:
+        x2 = ResidualBlock(dims * 4)(x2)
+        x2 = ResidualBlock(dims * 4)(x2)
+    if multiscale_count >= 2:
+        outputs.append(ToBgr(num_channels)(x2))
 
-        self.to_bgr = [ToBgr(num_channels, **kwargs) for _ in range(multiscale_count)]
+    x3 = Upscale(dims * 2)(x2)
+    if add_residual_blocks:
+        x3 = ResidualBlock(dims * 2)(x3)
+        x3 = ResidualBlock(dims * 2)(x3)
+    outputs.append(ToBgr(num_channels)(x3))
 
-    def call(self, inputs, **kwargs):
-        outputs = []
-        x1 = self.upscale_1(inputs)
-        if self.residual_blocks:
-            x1 = self.residual_blocks[0](x1)
-            x1 = self.residual_blocks[1](x1)
-        if len(self.to_bgr) > 2:
-            outputs += [self.to_bgr[2](x1)]
-
-        x2 = self.upscale_2(x1)
-        if self.residual_blocks:
-            x2 = self.residual_blocks[2](x2)
-            x2 = self.residual_blocks[3](x2)
-        if len(self.to_bgr) > 1:
-            outputs += [self.to_bgr[1](x2)]
-
-        x3 = self.upscale_3(x2)
-        if self.residual_blocks:
-            x3 = self.residual_blocks[4](x3)
-            x3 = self.residual_blocks[5](x3)
-        outputs += [self.to_bgr[0](x3)]
-
-        return outputs
+    return Model(inputs=inputs, outputs=outputs, name=name)
 
 
-class MaskDecoder(tf.keras.Model):
+
+
+class MaskDecoder(Model):
     def __init__(self, num_channels=1, ch_dims=1, **kwargs):
         super(MaskDecoder, self).__init__(**kwargs)
         dims = num_channels * ch_dims
@@ -260,7 +242,19 @@ class MaskDecoder(tf.keras.Model):
         return x
 
 
-class SparseAutoEncoder(tf.keras.Model):
+def sparse_auto_encoder(num_channels=3, resolution=32, ae_dims=16, e_ch_dims=42, d_ch_dims=21, multiscale_count=3, add_residual_blocks=True, name='SAE'):
+    encoder_model = encoder(num_channels=num_channels, resolution=resolution, ch_dims=e_ch_dims, ae_dims=ae_dims)
+    decoder_model = decoder(num_channels=num_channels, resolution=resolution, ch_dims=d_ch_dims, ae_dims=ae_dims,
+                      add_residual_blocks=add_residual_blocks, multiscale_count=multiscale_count)
+
+    inputs = Input(shape=(resolution, resolution, num_channels), name='image')
+    z = encoder_model(inputs)
+    outputs = decoder_model(z)
+
+    return Model(inputs=inputs, outputs=outputs, name=name)
+
+
+class _SparseAutoEncoder(object):
     def __init__(self,
                  num_channels=3,
                  resolution=32,
@@ -270,13 +264,13 @@ class SparseAutoEncoder(tf.keras.Model):
                  multiscale_count=3,
                  add_residual_blocks=True,
                  **kwargs):
-        super(SparseAutoEncoder, self).__init__(**kwargs)
-        self.encoder = Encoder(num_channels=num_channels, resolution=resolution, ch_dims=e_ch_dims, ae_dims=ae_dims)
-        self.decoder = Decoder(num_channels=num_channels, ch_dims=d_ch_dims, add_residual_blocks=add_residual_blocks, multiscale_count=multiscale_count)
+        super(_SparseAutoEncoder, self).__init__(**kwargs)
+        self.encoder = encoder(num_channels=num_channels, resolution=resolution, ch_dims=e_ch_dims, ae_dims=ae_dims)
+        self.decoder = decoder(num_channels=num_channels, resolution=resolution, ch_dims=d_ch_dims, ae_dims=ae_dims,
+                               add_residual_blocks=add_residual_blocks, multiscale_count=multiscale_count)
 
     def call(self, inputs, **kwargs):
         z = self.encoder(inputs)
-        # print('Shape:', tf.shape(z))
         reconstructed = self.decoder(z)
         return reconstructed
 
